@@ -37,17 +37,20 @@ func Builder(bidderName openrtb_ext.BidderName, config config.Adapter, server co
 	return bidder, nil
 }
 
+// peak226ImpCtx pairs a processed impression with the publisher ID declared on it, so that
+// each region group can resolve its own effective publisher ID independently of the others.
+type peak226ImpCtx struct {
+	imp         openrtb2.Imp
+	publisherID string
+}
+
 func (a *adapter) MakeRequests(request *openrtb2.BidRequest, reqInfo *adapters.ExtraRequestInfo) ([]*adapters.RequestData, []error) {
 	var errs []error
 
-	requestCopy := *request
-	imps := make([]openrtb2.Imp, 0, len(requestCopy.Imp))
+	impsByRegion := make(map[string][]peak226ImpCtx)
+	var regionOrder []string
 
-	var publisherID string
-	region := defaultRegion
-	haveRegion := false
-
-	for _, imp := range requestCopy.Imp {
+	for _, imp := range request.Imp {
 		var bidderExt adapters.ExtImpBidder
 		if err := jsonutil.Unmarshal(imp.Ext, &bidderExt); err != nil {
 			errs = append(errs, &errortypes.BadInput{
@@ -77,49 +80,72 @@ func (a *adapter) MakeRequests(request *openrtb2.BidRequest, reqInfo *adapters.E
 			imp.BidFloorCur = currencyUSD
 		}
 
-		if publisherID == "" && peak226Ext.PublisherID != "" {
-			publisherID = peak226Ext.PublisherID
-		}
-		if !haveRegion && peak226Ext.Region != "" {
-			region = peak226Ext.Region
-			haveRegion = true
+		region := peak226Ext.Region
+		if region == "" {
+			region = defaultRegion
 		}
 
-		imps = append(imps, imp)
+		if _, ok := impsByRegion[region]; !ok {
+			regionOrder = append(regionOrder, region)
+		}
+		impsByRegion[region] = append(impsByRegion[region], peak226ImpCtx{
+			imp:         imp,
+			publisherID: peak226Ext.PublisherID,
+		})
 	}
 
-	if len(imps) == 0 {
+	if len(regionOrder) == 0 {
 		return nil, errs
 	}
 
-	requestCopy.Imp = imps
-	setPublisherID(&requestCopy, publisherID)
+	requests := make([]*adapters.RequestData, 0, len(regionOrder))
 
-	endpoint, err := macros.ResolveMacros(a.endpoint, macros.EndpointTemplateParams{Region: region})
-	if err != nil {
-		errs = append(errs, err)
+	for _, region := range regionOrder {
+		group := impsByRegion[region]
+
+		imps := make([]openrtb2.Imp, 0, len(group))
+		var publisherID string
+		for _, ctx := range group {
+			imps = append(imps, ctx.imp)
+			if publisherID == "" && ctx.publisherID != "" {
+				publisherID = ctx.publisherID
+			}
+		}
+
+		requestCopy := *request
+		requestCopy.Imp = imps
+		setPublisherID(&requestCopy, publisherID)
+
+		endpoint, err := macros.ResolveMacros(a.endpoint, macros.EndpointTemplateParams{Region: region})
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+
+		requestJSON, err := jsonutil.Marshal(&requestCopy)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+
+		headers := http.Header{}
+		headers.Add("Content-Type", "application/json;charset=utf-8")
+		headers.Add("Accept", "application/json")
+
+		requests = append(requests, &adapters.RequestData{
+			Method:  http.MethodPost,
+			Uri:     endpoint,
+			Body:    requestJSON,
+			Headers: headers,
+			ImpIDs:  openrtb_ext.GetImpIDs(requestCopy.Imp),
+		})
+	}
+
+	if len(requests) == 0 {
 		return nil, errs
 	}
 
-	requestJSON, err := jsonutil.Marshal(&requestCopy)
-	if err != nil {
-		errs = append(errs, err)
-		return nil, errs
-	}
-
-	headers := http.Header{}
-	headers.Add("Content-Type", "application/json;charset=utf-8")
-	headers.Add("Accept", "application/json")
-
-	requestData := &adapters.RequestData{
-		Method:  http.MethodPost,
-		Uri:     endpoint,
-		Body:    requestJSON,
-		Headers: headers,
-		ImpIDs:  openrtb_ext.GetImpIDs(requestCopy.Imp),
-	}
-
-	return []*adapters.RequestData{requestData}, errs
+	return requests, errs
 }
 
 // setPublisherID mirrors the Prebid.js adapter's behavior of writing the publisherId
