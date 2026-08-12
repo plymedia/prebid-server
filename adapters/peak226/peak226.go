@@ -1,6 +1,7 @@
 package peak226
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"strings"
@@ -68,7 +69,13 @@ func (a *adapter) MakeRequests(request *openrtb2.BidRequest, reqInfo *adapters.E
 		}
 
 		imp.TagID = peak226Ext.PlacementID
-		imp.Ext = nil
+
+		if err := stripBidderExt(&imp); err != nil {
+			errs = append(errs, &errortypes.BadInput{
+				Message: fmt.Sprintf("imp #%s: %s", imp.ID, err.Error()),
+			})
+			continue
+		}
 
 		if imp.BidFloor > 0 && imp.BidFloorCur != "" && !strings.EqualFold(imp.BidFloorCur, currencyUSD) {
 			convertedValue, err := reqInfo.ConvertCurrency(imp.BidFloor, imp.BidFloorCur, currencyUSD)
@@ -146,6 +153,36 @@ func (a *adapter) MakeRequests(request *openrtb2.BidRequest, reqInfo *adapters.E
 	}
 
 	return requests, errs
+}
+
+// stripBidderExt removes only the "bidder" key from imp.ext, preserving non-bidder
+// signals such as gpid, data and tid that the Prebid.js adapter also forwards. When
+// nothing else remains, imp.Ext is cleared so the imp serializes without an empty "ext".
+func stripBidderExt(imp *openrtb2.Imp) error {
+	if len(imp.Ext) == 0 {
+		imp.Ext = nil
+		return nil
+	}
+
+	var ext map[string]json.RawMessage
+	if err := jsonutil.Unmarshal(imp.Ext, &ext); err != nil {
+		return err
+	}
+
+	delete(ext, "bidder")
+
+	if len(ext) == 0 {
+		imp.Ext = nil
+		return nil
+	}
+
+	updatedExt, err := jsonutil.Marshal(ext)
+	if err != nil {
+		return err
+	}
+	imp.Ext = updatedExt
+
+	return nil
 }
 
 // setPublisherID mirrors the Prebid.js adapter's behavior of writing the publisherId
